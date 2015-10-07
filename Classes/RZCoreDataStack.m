@@ -55,6 +55,8 @@ static NSString* const kRZCoreDataStackParentStackKey = @"RZCoreDataStackParentS
 
 @property (nonatomic, readonly, strong) NSDictionary *entityClassNamesToStalenessPredicates;
 
+@property (nonatomic, strong) NSHashTable *registeredFetchedResultsControllers;
+
 @end
 
 @implementation RZCoreDataStack
@@ -117,9 +119,11 @@ static NSString* const kRZCoreDataStackParentStackKey = @"RZCoreDataStackParentS
         _storeURL                   = storeURL;
         _persistentStoreCoordinator = psc;
         _options                    = options;
-        
+
         _backgroundContextQueue     = dispatch_queue_create("com.rzvinyl.backgroundContextQueue", DISPATCH_QUEUE_SERIAL);
-        
+
+        _registeredFetchedResultsControllers = [NSHashTable weakObjectsHashTable];
+
         if ( ![self buildStack] ) {
             return nil;
         }
@@ -148,7 +152,8 @@ static NSString* const kRZCoreDataStackParentStackKey = @"RZCoreDataStackParentS
         _options                    = options;
         
         _backgroundContextQueue     = dispatch_queue_create("com.rzvinyl.backgroundContextQueue", DISPATCH_QUEUE_SERIAL);
-        
+        _registeredFetchedResultsControllers = [NSHashTable weakObjectsHashTable];
+
         if ( ![self buildStack] ) {
             return nil;
         }
@@ -203,6 +208,14 @@ static NSString* const kRZCoreDataStackParentStackKey = @"RZCoreDataStackParentS
     [[tempContext userInfo] setObject:self forKey:kRZCoreDataStackParentStackKey];
     tempContext.parentContext = self.mainManagedObjectContext;
     return tempContext;
+}
+
+- (void)ensureContextNotificationsForFetchedResultsController:(NSFetchedResultsController *)frc
+{
+    if ( RZVAssert(frc.managedObjectContext == self.mainManagedObjectContext,
+                   @"Can only monitor FRC that attach to the main context") ) {
+        [self.registeredFetchedResultsControllers addObject:frc];
+    }
 }
 
 - (void)purgeStaleObjectsWithCompletion:(void (^)(NSError *))completion
@@ -433,7 +446,38 @@ static NSString* const kRZCoreDataStackParentStackKey = @"RZCoreDataStackParentS
 
 - (void)handleContextDidSave:(NSNotification *)notification
 {
+    NSArray *objectsToFault = nil;
+
+    if ( self.registeredFetchedResultsControllers.count > 0 ) {
+        // If we registered a FRC to fault, build the predicate on the main object context thread to
+        // ensure thread safety.
+        NSMutableArray *predicates = [NSMutableArray array];
+        [self.mainManagedObjectContext performBlockAndWait:^{
+            for ( NSFetchedResultsController *frc in [self.registeredFetchedResultsControllers allObjects] ) {
+                NSEntityDescription *entityDescription = frc.fetchRequest.entity;
+                NSPredicate *predicate = frc.fetchRequest.predicate;
+                if ( predicate ) {
+                    [predicates addObject:[NSPredicate predicateWithBlock:^BOOL(NSManagedObject *mo, NSDictionary *bindings) {
+                        return ([[mo entity] isEqual:entityDescription] && [predicate evaluateWithObject:mo]);
+                    }]];
+                }
+            }
+        }];
+        // If there are any predicates, build a list of objects to fault into the main context
+        // prior to the merge.
+        if ( [predicates count] > 0 ) {
+            NSPredicate *anyMatch = [NSCompoundPredicate orPredicateWithSubpredicates:predicates];
+            NSSet *updatedObjects = [[notification userInfo] objectForKey:NSUpdatedObjectsKey];
+            objectsToFault = [[updatedObjects allObjects] filteredArrayUsingPredicate:anyMatch];
+        }
+    }
+
     [self.mainManagedObjectContext performBlockAndWait:^{
+        for ( NSManagedObject *mo in objectsToFault ) {
+            NSManagedObject *mainMo = [self.mainManagedObjectContext objectWithID:[mo objectID]];
+            [mainMo willAccessValueForKey:nil];
+        }
+
         [self.mainManagedObjectContext mergeChangesFromContextDidSaveNotification:notification];
     }];
 }
