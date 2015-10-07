@@ -50,11 +50,9 @@ static NSString* const kRZCoreDataStackParentStackKey = @"RZCoreDataStackParentS
 @property (nonatomic, copy) NSString *modelConfiguration;
 @property (nonatomic, copy) NSString *storeType;
 @property (nonatomic, copy) NSURL    *storeURL;
-@property (nonatomic, strong) dispatch_queue_t backgroundContextQueue;
 @property (nonatomic, assign) RZCoreDataStackOptions options;
 
 @property (nonatomic, readonly, strong) NSDictionary *entityClassNamesToStalenessPredicates;
-
 @property (nonatomic, strong) NSHashTable *registeredFetchedResultsControllers;
 
 @end
@@ -119,17 +117,13 @@ static NSString* const kRZCoreDataStackParentStackKey = @"RZCoreDataStackParentS
         _storeURL                   = storeURL;
         _persistentStoreCoordinator = psc;
         _options                    = options;
-
-        _backgroundContextQueue     = dispatch_queue_create("com.rzvinyl.backgroundContextQueue", DISPATCH_QUEUE_SERIAL);
-
         _registeredFetchedResultsControllers = [NSHashTable weakObjectsHashTable];
-
+        
         if ( ![self buildStack] ) {
             return nil;
         }
-        
-        [self registerForNotifications];
     }
+    
     return self;
 }
 
@@ -150,23 +144,13 @@ static NSString* const kRZCoreDataStackParentStackKey = @"RZCoreDataStackParentS
         _storeURL                   = storeURL;
         _persistentStoreCoordinator = psc;
         _options                    = options;
-        
-        _backgroundContextQueue     = dispatch_queue_create("com.rzvinyl.backgroundContextQueue", DISPATCH_QUEUE_SERIAL);
-        _registeredFetchedResultsControllers = [NSHashTable weakObjectsHashTable];
 
         if ( ![self buildStack] ) {
             return nil;
         }
-        
-        [self registerForNotifications];
     }
     
     return self;
-}
-
-- (void)dealloc
-{
-    [self unregisterForNotifications];
 }
 
 #pragma mark - Public
@@ -177,29 +161,28 @@ static NSString* const kRZCoreDataStackParentStackKey = @"RZCoreDataStackParentS
         return;
     }
     
-    dispatch_async(self.backgroundContextQueue, ^{
-        NSManagedObjectContext *context = [self backgroundManagedObjectContext];
-        [context performBlockAndWait:^{
-            block(context);
-            NSError *err = nil;
-            [context rzv_saveToStoreAndWait:&err];
-            if ( completion ) {
-                dispatch_async(dispatch_get_main_queue(), ^{
-                    completion(err);
-                });
-            }
-        }];
-        [self unregisterSaveNotificationsForContext:context];
-    });
+    NSManagedObjectContext *context = self.topLevelBackgroundContext;
+    [context performBlock:^{
+        block(context);
+        
+        NSError *error = nil;
+        [context wta_saveContext:&error];
+        
+        if (completion)
+        {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                completion(error);
+            });
+        }
+    }];
 }
 
 - (NSManagedObjectContext *)backgroundManagedObjectContext
 {
-    NSManagedObjectContext *bgContext = [[NSManagedObjectContext alloc] initWithConcurrencyType:NSPrivateQueueConcurrencyType];
-    [[bgContext userInfo] setObject:self forKey:kRZCoreDataStackParentStackKey];
-    bgContext.parentContext = self.topLevelBackgroundContext;
-    [self registerSaveNotificationsForContext:bgContext];
-    return bgContext;
+//    NSManagedObjectContext *bgContext = [[NSManagedObjectContext alloc] initWithConcurrencyType:NSPrivateQueueConcurrencyType];
+//    [[bgContext userInfo] setObject:self forKey:kRZCoreDataStackParentStackKey];
+//    bgContext.parentContext = self.topLevelBackgroundContext;
+    return self.topLevelBackgroundContext;
 }
 
 - (NSManagedObjectContext *)temporaryManagedObjectContext
@@ -214,7 +197,6 @@ static NSString* const kRZCoreDataStackParentStackKey = @"RZCoreDataStackParentS
 {
     if ( RZVAssert(frc.managedObjectContext == self.mainManagedObjectContext,
                    @"Can only monitor FRC that attach to the main context") ) {
-        [self.registeredFetchedResultsControllers addObject:frc];
     }
 }
 
@@ -381,73 +363,41 @@ static NSString* const kRZCoreDataStackParentStackKey = @"RZCoreDataStackParentS
     //
     self.topLevelBackgroundContext = [[NSManagedObjectContext alloc] initWithConcurrencyType:NSPrivateQueueConcurrencyType];
     self.topLevelBackgroundContext.persistentStoreCoordinator = self.persistentStoreCoordinator;
+    self.topLevelBackgroundContext.mergePolicy = NSMergeByPropertyObjectTrumpMergePolicy;
     
     self.mainManagedObjectContext = [[NSManagedObjectContext alloc] initWithConcurrencyType:NSMainQueueConcurrencyType];
-    self.mainManagedObjectContext.parentContext = self.topLevelBackgroundContext;
+    self.mainManagedObjectContext.persistentStoreCoordinator = self.persistentStoreCoordinator;
+    self.mainManagedObjectContext.mergePolicy = NSMergeByPropertyObjectTrumpMergePolicy;
+
+    // Make sure everybody is listening
+    [[NSNotificationCenter defaultCenter] addObserver:self
+                                             selector:@selector(backgroundContextDidSave:)
+                                                 name:NSManagedObjectContextDidSaveNotification
+                                               object:self.topLevelBackgroundContext];
+    
+    [[NSNotificationCenter defaultCenter] addObserver:self
+                                             selector:@selector(backgroundContextDidSave:)
+                                                 name:NSManagedObjectContextDidSaveNotification
+                                               object:self.mainManagedObjectContext];
+    
+    [[NSNotificationCenter defaultCenter] addObserver:self
+                                             selector:@selector(handleAppDidEnterBackground:)
+                                                 name:UIApplicationDidEnterBackgroundNotification
+                                               object:nil];
+
     
     return YES;
 }
 
-#pragma mark - Notifications
-
-- (void)registerForNotifications
+- (void)dealloc
 {
-    [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(handleAppDidEnterBackground:) name:UIApplicationDidEnterBackgroundNotification object:nil];
-    [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(handleContextWillSave:) name:NSManagedObjectContextWillSaveNotification object:self.mainManagedObjectContext];
+    [[NSNotificationCenter defaultCenter] removeObserver:self];
 }
 
-- (void)unregisterForNotifications
-{
-    [[NSNotificationCenter defaultCenter] removeObserver:self name:UIApplicationDidEnterBackgroundNotification object:nil];
-    [[NSNotificationCenter defaultCenter] removeObserver:self name:NSManagedObjectContextWillSaveNotification object:self.mainManagedObjectContext];
-}
-
-- (void)registerSaveNotificationsForContext:(NSManagedObjectContext *)context
-{
-    [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(handleContextWillSave:) name:NSManagedObjectContextWillSaveNotification object:context];
-    [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(handleContextDidSave:) name:NSManagedObjectContextDidSaveNotification object:context];
-}
-
-- (void)unregisterSaveNotificationsForContext:(NSManagedObjectContext *)context
-{
-    [[NSNotificationCenter defaultCenter] removeObserver:self name:NSManagedObjectContextWillSaveNotification object:context];
-    [[NSNotificationCenter defaultCenter] removeObserver:self name:NSManagedObjectContextDidSaveNotification object:context];
-}
-
-- (void)handleAppDidEnterBackground:(NSNotification *)notification
-{
-    if ( [self hasOptionsSet:RZCoreDataStackOptionsEnableAutoStalePurge] ) {
-        
-        __block UIBackgroundTaskIdentifier backgroundPurgeTaskID = UIBackgroundTaskInvalid;
-        
-        backgroundPurgeTaskID = [[UIApplication sharedApplication] beginBackgroundTaskWithExpirationHandler:^{
-            [[UIApplication sharedApplication] endBackgroundTask:backgroundPurgeTaskID];
-            backgroundPurgeTaskID = UIBackgroundTaskInvalid;
-        }];
-        
-        [self purgeStaleObjectsWithCompletion:^(NSError *err) {
-            [[UIApplication sharedApplication] endBackgroundTask:backgroundPurgeTaskID];
-            backgroundPurgeTaskID = UIBackgroundTaskInvalid;
-        }];
-    }
-}
-
-- (void)handleContextWillSave:(NSNotification *)notification
-{
-    NSManagedObjectContext *context = [notification object];
-    NSArray *insertedObjects = [[context insertedObjects] allObjects];
-    if ( insertedObjects.count > 0 ) {
-        NSError *err = nil;
-        if ( ![context obtainPermanentIDsForObjects:insertedObjects error:&err] ) {
-            RZVLogError(@"Error obtaining permanent ID's for inserted objects before save: %@", err);
-        }
-    }
-}
-
-- (void)handleContextDidSave:(NSNotification *)notification
+- (void)backgroundContextDidSave:(NSNotification *)notification
 {
     NSArray *objectsToFault = nil;
-
+    
     if ( self.registeredFetchedResultsControllers.count > 0 ) {
         // If we registered a FRC to fault, build the predicate on the main object context thread to
         // ensure thread safety.
@@ -471,15 +421,40 @@ static NSString* const kRZCoreDataStackParentStackKey = @"RZCoreDataStackParentS
             objectsToFault = [[updatedObjects allObjects] filteredArrayUsingPredicate:anyMatch];
         }
     }
-
+    
     [self.mainManagedObjectContext performBlockAndWait:^{
         for ( NSManagedObject *mo in objectsToFault ) {
             NSManagedObject *mainMo = [self.mainManagedObjectContext objectWithID:[mo objectID]];
             [mainMo willAccessValueForKey:nil];
         }
-
+        
         [self.mainManagedObjectContext mergeChangesFromContextDidSaveNotification:notification];
     }];
+}
+
+- (void)mainContextDidSave:(NSNotification *)notification
+{
+    [self.topLevelBackgroundContext performBlock:^{
+        [self.topLevelBackgroundContext mergeChangesFromContextDidSaveNotification:notification];
+    }];
+}
+
+- (void)handleAppDidEnterBackground:(NSNotification *)notification
+{
+    if ( [self hasOptionsSet:RZCoreDataStackOptionsEnableAutoStalePurge] ) {
+        
+        __block UIBackgroundTaskIdentifier backgroundPurgeTaskID = UIBackgroundTaskInvalid;
+        
+        backgroundPurgeTaskID = [[UIApplication sharedApplication] beginBackgroundTaskWithExpirationHandler:^{
+            [[UIApplication sharedApplication] endBackgroundTask:backgroundPurgeTaskID];
+            backgroundPurgeTaskID = UIBackgroundTaskInvalid;
+        }];
+        
+        [self purgeStaleObjectsWithCompletion:^(NSError *err) {
+            [[UIApplication sharedApplication] endBackgroundTask:backgroundPurgeTaskID];
+            backgroundPurgeTaskID = UIBackgroundTaskInvalid;
+        }];
+    }
 }
 
 @end

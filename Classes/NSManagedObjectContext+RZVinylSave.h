@@ -63,4 +63,6 @@ typedef void (^RZVinylSaveCompletion)(NSError *error);
  */
 - (BOOL)rzv_saveToStoreAndWait:(NSError *__autoreleasing *)error;
 
+- (BOOL)wta_saveContext:(NSError **)error;
+
 @end

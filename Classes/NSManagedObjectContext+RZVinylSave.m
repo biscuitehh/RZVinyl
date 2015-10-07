@@ -101,4 +101,40 @@ static void rzv_performSaveCompletionAsync(RZVinylSaveCompletion completion, NSE
     return (saveErr == nil);
 }
 
+- (BOOL)wta_saveContext:(NSError **)error
+{
+    __block BOOL hasChanges = NO;
+    if ([self concurrencyType] == NSConfinementConcurrencyType)
+    {
+        hasChanges = [self hasChanges];
+    }
+    else
+    {
+        [self performBlockAndWait:^{
+            hasChanges = [self hasChanges];
+        }];
+    }
+    
+    __block BOOL saveResult = NO;
+    @try
+    {
+        if ([self concurrencyType] == NSConfinementConcurrencyType)
+        {
+            saveResult = [self save:nil];
+        }
+        else
+        {
+            [self performBlockAndWait:^{
+                saveResult = [self save:error];
+            }];
+        }
+    }
+    @catch(NSException *exception)
+    {
+        NSLog(@"Unable to perform save: %@", (id)[exception userInfo] ?: (id)[exception reason]);
+    }
+    
+    return saveResult;
+}
+
 @end
